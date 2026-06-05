@@ -1,0 +1,7 @@
+__pycache__/
+*.jsonl
+*.log
+checkpoints/
+chkpoints_v2/
+*.json
+data/
