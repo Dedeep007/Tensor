@@ -14,6 +14,10 @@ export const GraphState = Annotation.Root({
     reducer: (x, y) => y,
     default: () => "",
   }),
+  workspaceRoot: Annotation<string>({
+    reducer: (x, y) => y,
+    default: () => "",
+  }),
   llmConfig: Annotation<any>({
     reducer: (x, y) => y,
     default: () => ({ provider: "groq", apiKey: "", modelName: "llama3-70b-8192" }),

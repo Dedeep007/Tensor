@@ -1,4 +1,5 @@
-import { StateGraph, START, END } from "@langchain/langgraph";
+import { StateGraph, START, END, MemorySaver } from "@langchain/langgraph";
+const memory = new MemorySaver();
 import { ChatGroq } from "@langchain/groq";
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatAnthropic } from "@langchain/anthropic";
@@ -10,17 +11,24 @@ import { ChatBedrockConverse } from "@langchain/aws";
 import { GraphState, State } from "./state";
 import { 
   readFile, 
+  createFile,
   preciseCodeEdit, 
+  readFileLines,
+  multiLineEdit, 
   findFiles, 
   findTextInFiles, 
   listDirectory, 
   readProjectStructure, 
   getErrors, 
-  applyPatch 
+  applyPatch,
+  runBackgroundCommand,
+  cancelCommand,
+  searchCodebase
 } from "./tools";
+import * as fs from "fs/promises";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 
-function getLLM(config: any): any {
+export function getLLM(config: any): any {
   if (config.provider === "openai") {
     return new ChatOpenAI({ modelName: config.modelName || "gpt-4o", openAIApiKey: config.apiKey, temperature: 0 });
   } else if (config.provider === "anthropic") {
@@ -43,6 +51,27 @@ function getLLM(config: any): any {
 
 async function Viewer_Node(state: State): Promise<Partial<State>> {
   let context = "";
+  
+  if (state.workspaceRoot) {
+    try {
+      // Add top-level workspace awareness
+      const entries = await fs.readdir(state.workspaceRoot, { withFileTypes: true });
+      context += `\n--- Workspace Root (${state.workspaceRoot}) ---\n`;
+      context += entries.map(e => `${e.isDirectory() ? "[DIR]" : "[FILE]"} ${e.name}`).join("\n") + "\n";
+    } catch (e) {
+      context += `\n--- Workspace Root ---\nError reading directory.\n`;
+    }
+
+    try {
+      // Check for .xsorrules
+      const rulesPath = `${state.workspaceRoot}/.xsorrules`;
+      const rulesContent = await fs.readFile(rulesPath, "utf8");
+      context += `\n--- .xsorrules (Project Instructions) ---\n${rulesContent}\n`;
+    } catch (e) {
+      // No .xsorrules found, ignore
+    }
+  }
+
   for (const file of state.activeFiles) {
     try {
       const content = await readFile.invoke({ filePath: file });
@@ -56,10 +85,10 @@ async function Viewer_Node(state: State): Promise<Partial<State>> {
 
 async function Compactor_Node(state: State): Promise<Partial<State>> {
   const llm = getLLM(state.llmConfig);
-  const MAX_CHARS = 10000;
+  const MAX_CHARS = 4000;
   if (state.sessionContext.length > MAX_CHARS) {
     const summaryPrompt = `Summarize the following code context briefly to save tokens: \n\n${state.sessionContext}`;
-    const response = await llm.invoke([new HumanMessage(summaryPrompt)]);
+    const response = await llm.invoke([new HumanMessage(summaryPrompt)], { tags: ["hide"] });
     return {
       sessionContext: "",
       fastRecallPointers: [response.content as string],
@@ -92,7 +121,10 @@ async function Supervisor_Node(state: State): Promise<Partial<State>> {
   
   const supervisorLlm = llm.bindTools(subagentTools);
   const messages = [
-    new SystemMessage(`You are the Supervisor node in an agentic IDE. Decide which sub-agent to route to based on the user's request. If the user's request is fulfilled, respond to the user directly without routing. Context: ${state.sessionContext} \nPointers: ${state.fastRecallPointers.join(" | ")}`),
+    new SystemMessage(`You are the Supervisor node in an agentic IDE. Your job is to orchestrate tasks by routing to the appropriate sub-agents. 
+CRITICAL RULE: If the user asks to create, write, modify, or edit code/files, you MUST route to the 'Editor_Subagent' using the 'route_to_editor' tool. Do NOT just output the code in your response. The Editor sub-agent has the tools to actually create and edit files on disk.
+If the user's request is just a question and is fulfilled, respond to the user directly without routing.
+Context: ${state.sessionContext} \nPointers: ${state.fastRecallPointers.join(" | ")}`),
     ...state.messages,
   ];
   
@@ -112,9 +144,9 @@ async function Supervisor_Node(state: State): Promise<Partial<State>> {
 
 async function Search_Subagent(state: State): Promise<Partial<State>> {
   const llm = getLLM(state.llmConfig);
-  const searchLlm = llm.bindTools([findFiles, findTextInFiles, listDirectory, readProjectStructure, readFile]);
+  const searchLlm = llm.bindTools([listDirectory, searchCodebase, readFile, readFileLines]);
   const messages = [
-    new SystemMessage("You are the Search Sub-agent. Your goal is to explore the codebase and gather context quickly."),
+    new SystemMessage("You are the Search Sub-agent. Explore directories and search the codebase for relevant functions or definitions."),
     ...state.messages,
   ];
   const response = await searchLlm.invoke(messages);
@@ -123,7 +155,7 @@ async function Search_Subagent(state: State): Promise<Partial<State>> {
 
 async function Editor_Subagent(state: State): Promise<Partial<State>> {
   const llm = getLLM(state.llmConfig);
-  const editorLlm = llm.bindTools([preciseCodeEdit, applyPatch, readFile]);
+  const editorLlm = llm.bindTools([preciseCodeEdit, multiLineEdit, applyPatch, createFile, readFile, readFileLines]);
   const messages = [
     new SystemMessage("You are the Editor Sub-agent. Execute edits safely without hallucination."),
     ...state.messages,
@@ -134,9 +166,9 @@ async function Editor_Subagent(state: State): Promise<Partial<State>> {
 
 async function Execution_Subagent(state: State): Promise<Partial<State>> {
   const llm = getLLM(state.llmConfig);
-  const execLlm = llm.bindTools([getErrors]);
+  const execLlm = llm.bindTools([getErrors, runBackgroundCommand, cancelCommand]);
   const messages = [
-    new SystemMessage("You are the Execution Sub-agent. Fetch compilation and lint errors to validate changes."),
+    new SystemMessage("You are the Execution Sub-agent. Fetch compilation errors or manage background processes."),
     ...state.messages,
   ];
   const response = await execLlm.invoke(messages);
@@ -169,4 +201,4 @@ export const graph = new StateGraph(GraphState)
   .addEdge("Search_Subagent", "Supervisor_Node")
   .addEdge("Editor_Subagent", "Supervisor_Node")
   .addEdge("Execution_Subagent", "Supervisor_Node")
-  .compile();
+  .compile({ checkpointer: memory });
